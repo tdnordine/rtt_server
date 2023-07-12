@@ -9,6 +9,7 @@ fi
 if [[ $1 =~ (.+)@(.+) ]] ; then
     echo "$1"
     sqlite3 ../db "INSERT INTO whitelist_mail (mail) VALUES ($1)"
+    echo "email added."
 fi
 
 echo "Done."
