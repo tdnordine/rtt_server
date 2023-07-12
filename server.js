@@ -259,6 +259,7 @@ function hash_password(password, salt) {
  */
 
 const SQL_BLACKLIST_MAIL = SQL("SELECT EXISTS ( SELECT 1 FROM blacklist_mail WHERE ? LIKE mail )").pluck()
+const SQL_WHITELIST_MAIL = SQL("SELECT EXISTS ( SELECT 1 FROM whitelist_mail WHERE ? LIKE mail )").pluck()
 
 const SQL_EXISTS_USER_NAME = SQL("SELECT EXISTS ( SELECT 1 FROM users WHERE name=? )").pluck()
 const SQL_EXISTS_USER_MAIL = SQL("SELECT EXISTS ( SELECT 1 FROM users WHERE mail=? )").pluck()
@@ -298,6 +299,12 @@ const SQL_VERIFY_TOKEN = SQL("SELECT EXISTS ( SELECT 1 FROM tokens WHERE user_id
 
 function is_blacklisted(mail) {
 	if (SQL_BLACKLIST_MAIL.get(mail) === 1)
+		return true
+	return false
+}
+
+function is_whitelisted(mail) {
+	if (SQL_WHITELIST_MAIL.get(mail) === 1)
 		return true
 	return false
 }
@@ -400,6 +407,8 @@ app.post('/signup', function (req, res) {
 		return err("That name is already taken.")
 	if (!is_valid_email(mail) || is_blacklisted(mail))
 		return err("Invalid mail address!")
+	if (!is_whitelisted(mail))
+		return err("You have not been invited to play on this server.")
 	if (SQL_EXISTS_USER_MAIL.get(mail))
 		return err("That mail is already taken.")
 	if (password.length < 4)

@@ -2,6 +2,11 @@
 
 create table if not exists blacklist_mail ( mail text primary key ) without rowid;
 
+-- whitelist --
+
+create table if not exists whitelist_mail ( mail text primary key ) without rowid;
+
+
 -- Titles --
 
 create table if not exists titles (
