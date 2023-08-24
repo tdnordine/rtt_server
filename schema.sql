@@ -284,7 +284,8 @@ create table if not exists games (
 	is_random boolean default 0,
 	notice text,
 	status integer default 0,
-	result text
+	result text,
+	xtime datetime
 );
 
 create index if not exists games_title_idx on games(title_id);
@@ -298,12 +299,13 @@ create table if not exists game_state (
 );
 
 create table if not exists game_chat (
-	chat_id integer primary key,
 	game_id integer,
-	time datetime default current_timestamp,
+	chat_id integer,
 	user_id integer,
-	message text
-);
+	time datetime default current_timestamp,
+	message text,
+	primary key (game_id, chat_id)
+) without rowid;
 
 create table if not exists unread_chats (
 	user_id integer,
@@ -314,13 +316,11 @@ create table if not exists unread_chats (
 drop view if exists game_chat_view;
 create view game_chat_view as
 	select
-		chat_id, game_id, time, name, message
+		game_id, chat_id, time, name, message
 	from
 		game_chat
 		natural join users
 	;
-
-create index if not exists game_chat_idx on game_chat(game_id);
 
 create table if not exists game_replay (
 	game_id integer,
@@ -362,7 +362,7 @@ create view game_view as
 		games.*,
 		titles.title_name,
 		owner.name as owner_name,
-		game_state.mtime,
+		coalesce(game_state.mtime, xtime) as mtime,
 		game_state.active
 	from
 		games
@@ -443,6 +443,20 @@ create view your_turn as
 		status = 1
 		and active in ('All', 'Both', role)
 	;
+
+-- Trigger to remove game data when filing a game as archived
+
+drop trigger if exists trigger_archive_game;
+create trigger trigger_archive_game after update on games when new.status = 3
+begin
+	delete from game_state where game_id = old.game_id;
+	delete from game_chat where game_id = old.game_id;
+	delete from game_replay where game_id = old.game_id;
+	delete from game_snap where game_id = old.game_id;
+	delete from game_notes where game_id = old.game_id;
+	delete from last_notified where game_id = old.game_id;
+	delete from unread_chats where game_id = old.game_id;
+end;
 
 -- Triggers to clean up without relying on foreign key cascades
 
