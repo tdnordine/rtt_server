@@ -381,7 +381,10 @@ function on_game_over() {
 function init_player_names(players) {
 	for (let i = 0; i < roles.length; ++i) {
 		let p = players.find(p => p.role === roles[i].role)
-		document.getElementById(roles[i].id).querySelector(".role_user").textContent = p ? p.name : "NONE"
+		if (p)
+			document.getElementById(roles[i].id).querySelector(".role_user").innerHTML = `<a href="/user/${p.name}" target="_blank">${p.name}</a>`
+		else
+			document.getElementById(roles[i].id).querySelector(".role_user").textContent = "NONE"
 	}
 }
 
@@ -442,6 +445,15 @@ function connect_play() {
 		let arg = msg_data[1]
 		console.log("MESSAGE", cmd)
 		switch (cmd) {
+		case "warning":
+			document.getElementById("prompt").textContent = arg
+			document.querySelector("header").classList.add("disconnected")
+			setTimeout(() => {
+				document.querySelector("header").classList.remove("disconnected")
+				on_update_header()
+			}, 1000)
+			break
+
 		case "error":
 			document.getElementById("prompt").textContent = arg
 			if (view) {

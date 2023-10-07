@@ -23,11 +23,32 @@ html
 								option(value=scenario)= scenario
 				else
 					input(type="hidden" name="scenario" value=scenarios[0])
-				| !{ create_html }
+				| !{ title.create_html }
 
 				p Notice:
 					br
 					input(type="text" autocomplete="off" name="notice" size=50 placeholder="What are you looking for?")
+
+				p Pace:
+					br
+					label
+						input(type="radio" name="pace" value="0" checked)
+						| Any
+
+					br
+					label
+						input(type="radio" name="pace" value="1")
+						| #{EMOJI_LIVE} Live
+
+					br
+					label
+						input(type="radio" name="pace" value="2")
+						| #{EMOJI_FAST} Fast <i>&ndash; many moves per day</i>
+
+					br
+					label
+						input(type="radio" name="pace" value="3")
+						| #{EMOJI_SLOW} Slow <i>&ndash; one move per day</i>
 
 				p
 					label
@@ -38,5 +59,9 @@ html
 					label
 						input(type="checkbox" name="is_private" value="true")
 						| Private
-				p
-				button(type="submit") Create
+
+				if limit
+					p.error= limit
+				else
+					p
+						button(type="submit") Create

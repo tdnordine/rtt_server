@@ -21,8 +21,18 @@ const HTTP_PORT = process.env.HTTP_PORT || 8080
 const SITE_NAME = process.env.SITE_NAME || "Localhost"
 const SITE_URL = process.env.SITE_URL || "http://" + HTTP_HOST + ":" + HTTP_PORT
 
+const LIMIT_WAITING_GAMES = (process.env.LIMIT_WAITING_GAMES | 0) || 3
+const LIMIT_OPEN_GAMES = (process.env.LIMIT_OPEN_GAMES | 0) || 7
+const LIMIT_ACTIVE_GAMES = (process.env.LIMIT_ACTIVE_GAMES | 0) || 29
+
 const REGEX_MAIL = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*$/
 const REGEX_NAME = /^[\p{Alpha}\p{Number}'_-]+( [\p{Alpha}\p{Number}'_-]+)*$/u
+
+const WEBHOOKS = process.env.WEBHOOKS | 0
+if (WEBHOOKS)
+	console.log("Webhook notifications enabled.")
+else
+	console.log("Webhook notifications disabled.")
 
 function LOG_STATS() {
 	// Count clients connected to join page events
@@ -44,12 +54,22 @@ function LOG_STATS() {
 
 setInterval(LOG_STATS, 60 * 1000)
 
+/* CONNECTED CLIENT INFO */
+
+var join_clients = {}
+var game_clients = {}
+var game_cookies = {}
+
 /*
  * Main database.
  */
 
 let db = new sqlite3(process.env.DATABASE || "./db")
 db.pragma("synchronous = NORMAL")
+
+const SQL_BEGIN = db.prepare("begin")
+const SQL_COMMIT = db.prepare("commit")
+const SQL_ROLLBACK = db.prepare("rollback")
 
 db.exec("delete from logins where julianday() > julianday(expires)")
 db.exec("delete from tokens where julianday() > julianday(time, '+1 days')")
@@ -90,11 +110,6 @@ if (process.env.MAIL_HOST && process.env.MAIL_PORT && process.env.MAIL_FROM) {
 	console.log("Mail notifications enabled: ", mailer.options)
 } else {
 	console.log("Mail notifications disabled.")
-	mailer = {
-		sendMail(obj, callback) {
-			callback("DID NOT SEND: " + JSON.stringify(obj,0,4))
-		}
-	}
 }
 
 /*
@@ -149,8 +164,17 @@ function set_static_headers(res, path) {
 }
 
 let app = express()
+
 app.locals.SITE_NAME = SITE_NAME
 app.locals.SITE_URL = SITE_URL
+app.locals.ENABLE_MAIL = !!mailer
+app.locals.ENABLE_WEBHOOKS = !!WEBHOOKS
+app.locals.ENABLE_FORUM = process.env.FORUM | 0
+
+app.locals.EMOJI_LIVE = "\u{1f465}"
+app.locals.EMOJI_FAST = "\u{1f3c1}"
+app.locals.EMOJI_SLOW = "\u{1f40c}"
+
 app.set('x-powered-by', false)
 app.set('etag', false)
 app.set('view engine', 'pug')
@@ -180,6 +204,16 @@ function play_url(title_id, game_id, role, mode) {
 
 function random_seed() {
 	return crypto.randomInt(1, 2**35-31)
+}
+
+function shuffle(list) {
+	// Fisher-Yates shuffle
+	for (let i = list.length - 1; i > 0; --i) {
+		let j = crypto.randomInt(i + 1)
+		let tmp = list[j]
+		list[j] = list[i]
+		list[i] = tmp
+	}
 }
 
 function epoch_from_julianday(x) {
@@ -276,12 +310,12 @@ const SQL_SELECT_USER_PROFILE = SQL("SELECT * FROM user_profile_view WHERE name=
 const SQL_SELECT_USER_DYNAMIC = SQL("select * from user_dynamic_view where user_id=?")
 const SQL_SELECT_USER_ID = SQL("SELECT user_id FROM users WHERE name=?").pluck()
 
-const SQL_OFFLINE_USER = SQL("SELECT * FROM user_view NATURAL JOIN user_last_seen WHERE user_id=? AND julianday() > julianday(atime, ?)")
-
 const SQL_SELECT_USER_NOTIFY = SQL("SELECT notify FROM users WHERE user_id=?").pluck()
+const SQL_SELECT_USER_VERIFIED = SQL("SELECT is_verified FROM users WHERE user_id=?").pluck()
 const SQL_UPDATE_USER_NOTIFY = SQL("UPDATE users SET notify=? WHERE user_id=?")
 const SQL_UPDATE_USER_NAME = SQL("UPDATE users SET name=? WHERE user_id=?")
 const SQL_UPDATE_USER_MAIL = SQL("UPDATE users SET mail=? WHERE user_id=?")
+const SQL_UPDATE_USER_VERIFIED = SQL("UPDATE users SET is_verified=? WHERE user_id=?")
 const SQL_UPDATE_USER_ABOUT = SQL("UPDATE users SET about=? WHERE user_id=?")
 const SQL_UPDATE_USER_PASSWORD = SQL("UPDATE users SET password=?, salt=? WHERE user_id=?")
 const SQL_UPDATE_USER_LAST_SEEN = SQL("INSERT OR REPLACE INTO user_last_seen (user_id,atime) VALUES (?,datetime())")
@@ -291,6 +325,7 @@ const SQL_SELECT_WEBHOOK = SQL("SELECT * FROM webhooks WHERE user_id=?")
 const SQL_SELECT_WEBHOOK_SEND = SQL("SELECT url, format, prefix FROM webhooks WHERE user_id=? AND error is null")
 const SQL_UPDATE_WEBHOOK = SQL("INSERT OR REPLACE INTO webhooks (user_id, url, format, prefix, error) VALUES (?,?,?,?,null)")
 const SQL_UPDATE_WEBHOOK_ERROR = SQL("UPDATE webhooks SET error=? WHERE user_id=?")
+const SQL_UPDATE_WEBHOOK_SUCCESS = SQL("UPDATE webhooks SET error=null WHERE user_id=? AND error IS NOT NULL")
 const SQL_DELETE_WEBHOOK = SQL("DELETE FROM webhooks WHERE user_id=?")
 
 const SQL_FIND_TOKEN = SQL("SELECT token FROM tokens WHERE user_id=? AND julianday('now') < julianday(time, '+5 minutes')").pluck()
@@ -347,11 +382,11 @@ function must_be_administrator(req, res, next) {
 }
 
 app.get('/', function (req, res) {
-	res.render('index.pug', { user: req.user, titles: TITLES })
+	res.render('index.pug', { user: req.user })
 })
 
 app.get('/create', must_be_logged_in, function (req, res) {
-	res.render('create-index.pug', { user: req.user, titles: TITLES })
+	res.render('create-index.pug', { user: req.user })
 })
 
 app.get('/about', function (req, res) {
@@ -422,6 +457,34 @@ app.post('/signup', function (req, res) {
 	res.redirect('/profile')
 })
 
+function create_and_mail_verification_token(user) {
+	if (!SQL_FIND_TOKEN.get(user.user_id))
+		mail_verification_token(user, SQL_CREATE_TOKEN.get(user.user_id))
+}
+
+app.get('/verify-mail', must_be_logged_in, function (req, res) {
+	if (SQL_SELECT_USER_VERIFIED.get(req.user.user_id))
+		return res.redirect("/profile")
+	create_and_mail_verification_token(req.user)
+	res.render('verify_mail.pug', { user: req.user })
+})
+
+app.get('/verify-mail/:token', must_be_logged_in, function (req, res) {
+	if (SQL_SELECT_USER_VERIFIED.get(req.user.user_id))
+		return res.redirect("/profile")
+	res.render('verify_mail.pug', { user: req.user, token: req.params.token })
+})
+
+app.post('/verify-mail', must_be_logged_in, function (req, res) {
+	if (SQL_VERIFY_TOKEN.get(req.user.user_id, req.body.token)) {
+		SQL_UPDATE_USER_VERIFIED.run(1, req.user.user_id)
+		res.redirect("/profile")
+	} else {
+		create_and_mail_verification_token(req.user)
+		res.render('verify_mail.pug', { user: req.user, flash: "Invalid or expired token!" })
+	}
+})
+
 app.get('/forgot-password', function (req, res) {
 	if (req.user)
 		return res.redirect('/')
@@ -482,6 +545,7 @@ app.post('/reset-password', function (req, res) {
 	let salt = crypto.randomBytes(32).toString('hex')
 	let hash = hash_password(password, salt)
 	SQL_UPDATE_USER_PASSWORD.run(hash, salt, user.user_id)
+	SQL_UPDATE_USER_VERIFIED.run(1, user.user_id)
 	login_insert(res, user.user_id)
 	return res.redirect('/profile')
 })
@@ -555,19 +619,19 @@ app.get('/webhook', must_be_logged_in, function (req, res) {
 	res.render('webhook.pug', { user: req.user, webhook: webhook })
 })
 
-app.post("/delete-webhook", must_be_logged_in, function (req, res) {
+app.post("/api/webhook/delete", must_be_logged_in, function (req, res) {
 	SQL_DELETE_WEBHOOK.run(req.user.user_id)
 	res.redirect("/webhook")
 })
 
-app.post("/update-webhook", must_be_logged_in, function (req, res) {
+app.post("/api/webhook/update", must_be_logged_in, function (req, res) {
 	let url = req.body.url
 	let prefix = req.body.prefix
 	let format = req.body.format
 	SQL_UPDATE_WEBHOOK.run(req.user.user_id, url, format, prefix)
 	const webhook = SQL_SELECT_WEBHOOK_SEND.get(req.user.user_id)
 	if (webhook)
-		send_webhook(req.user.user_id, webhook, "Test message!")
+		send_webhook(req.user.user_id, webhook, "Test message!", 0)
 	res.setHeader("refresh", "3; url=/webhook")
 	res.send("Testing Webhook. Please wait...")
 })
@@ -597,6 +661,7 @@ app.post('/change-mail', must_be_logged_in, function (req, res) {
 	if (SQL_EXISTS_USER_MAIL.get(newmail))
 		return res.render('change_mail.pug', { user: req.user, flash: "That mail address is already taken!" })
 	SQL_UPDATE_USER_MAIL.run(newmail, req.user.user_id)
+	SQL_UPDATE_USER_VERIFIED.run(0, req.user.user_id)
 	return res.redirect('/profile')
 })
 
@@ -615,7 +680,7 @@ app.get('/user/:who_name', function (req, res) {
 	if (who) {
 		who.ctime = human_date(who.ctime)
 		who.atime = human_date(who.atime)
-		let games = QUERY_LIST_ACTIVE_GAMES_OF_USER.all({ user_id: who.user_id })
+		let games = QUERY_LIST_PUBLIC_GAMES_OF_USER.all({ user_id: who.user_id })
 		annotate_games(games, 0, null)
 		let relation = 0
 		if (req.user)
@@ -648,7 +713,7 @@ app.get('/contacts', must_be_logged_in, function (req, res) {
 	})
 })
 
-app.get("/contact/remove/:who_name", must_be_logged_in, function (req, res) {
+app.get("/contacts/remove/:who_name", must_be_logged_in, function (req, res) {
 	let who = SQL_SELECT_USER_BY_NAME.get(req.params.who_name)
 	if (!who)
 		return res.status(404).send("User not found.")
@@ -656,7 +721,7 @@ app.get("/contact/remove/:who_name", must_be_logged_in, function (req, res) {
 	return res.redirect("/contacts")
 })
 
-app.get("/contact/add-friend/:who_name", must_be_logged_in, function (req, res) {
+app.get("/contacts/add-friend/:who_name", must_be_logged_in, function (req, res) {
 	let who = SQL_SELECT_USER_BY_NAME.get(req.params.who_name)
 	if (!who)
 		return res.status(404).send("User not found.")
@@ -664,7 +729,7 @@ app.get("/contact/add-friend/:who_name", must_be_logged_in, function (req, res) 
 	return res.redirect("/user/" + who.name)
 })
 
-app.get("/contact/add-enemy/:who_name", must_be_logged_in, function (req, res) {
+app.get("/contacts/add-enemy/:who_name", must_be_logged_in, function (req, res) {
 	let who = SQL_SELECT_USER_BY_NAME.get(req.params.who_name)
 	if (!who)
 		return res.status(404).send("User not found.")
@@ -773,8 +838,7 @@ app.post('/message/send', must_be_logged_in, function (req, res) {
 		})
 	}
 	let info = MESSAGE_SEND.run(req.user.user_id, to_user.user_id, subject, body)
-	if (to_user.notify)
-		mail_new_message(to_user, info.lastInsertRowid, req.user.name)
+	send_notification(to_user, message_link(info.lastInsertRowid), "New message from " + req.user.name)
 	res.redirect('/inbox')
 })
 
@@ -801,16 +865,16 @@ app.get('/message/reply/:message_id', must_be_logged_in, function (req, res) {
 	})
 })
 
+app.get('/message/delete/outbox', must_be_logged_in, function (req, res) {
+	MESSAGE_DELETE_ALL_OUTBOX.run(req.user.user_id)
+	res.redirect('/outbox')
+})
+
 app.get('/message/delete/:message_id', must_be_logged_in, function (req, res) {
 	let message_id = req.params.message_id | 0
 	MESSAGE_DELETE_INBOX.run(message_id, req.user.user_id)
 	MESSAGE_DELETE_OUTBOX.run(message_id, req.user.user_id)
 	res.redirect('/inbox')
-})
-
-app.get('/outbox/delete', must_be_logged_in, function (req, res) {
-	MESSAGE_DELETE_ALL_OUTBOX.run(req.user.user_id)
-	res.redirect('/outbox')
 })
 
 /*
@@ -1002,27 +1066,50 @@ app.get('/forum/search', must_be_logged_in, function (req, res) {
  * GAME LOBBY
  */
 
-let TITLES = {}
 let RULES = {}
-let HTML_ABOUT = {}
-let HTML_CREATE = {}
+let TITLE_TABLE = app.locals.TITLE_TABLE = {}
+let TITLE_LIST = app.locals.TITLE_LIST = []
+let TITLE_NAME = app.locals.TITLE_NAME = {}
+let SETUP_LIST = app.locals.SETUP_LIST = []
+let SETUP_TABLE = app.locals.SETUP_TABLE = {}
 
 const STATUS_OPEN = 0
 const STATUS_ACTIVE = 1
 const STATUS_FINISHED = 2
 const STATUS_ARCHIVED = 3
 
+const PACE_ANY = 0
+const PACE_LIVE = 1
+const PACE_FAST = 2
+const PACE_SLOW = 3
+
+const PACE_NAME = [ "Any", "Live", "Fast", "Slow" ]
+
 function load_rules() {
-	const SQL_SELECT_TITLES = SQL("SELECT * FROM titles")
+	const SQL_SELECT_TITLES = SQL("select * from titles")
+	const SQL_SELECT_SETUPS = SQL("select * from setups where title_id=? order by setup_id")
 	for (let title of SQL_SELECT_TITLES.all()) {
 		let title_id = title.title_id
 		if (fs.existsSync(__dirname + "/public/" + title_id + "/rules.js")) {
 			console.log("Loading rules for " + title_id)
 			try {
-				TITLES[title_id] = title
 				RULES[title_id] = require("./public/" + title_id + "/rules.js")
-				HTML_ABOUT[title_id] = fs.readFileSync("./public/" + title_id + "/about.html")
-				HTML_CREATE[title_id] = fs.readFileSync("./public/" + title_id + "/create.html")
+				TITLE_LIST.push(title)
+				TITLE_TABLE[title_id] = title
+				TITLE_NAME[title_id] = title.title_name
+				title.setups = SQL_SELECT_SETUPS.all(title_id)
+				for (let setup of title.setups) {
+					if (!setup.setup_name) {
+						if (title.setups.length > 1 && setup.scenario !== "Standard")
+							setup.setup_name = title.title_name + " - " + setup.scenario
+						else
+							setup.setup_name = title.title_name
+					}
+					SETUP_LIST.push(setup)
+					SETUP_TABLE[setup.setup_id] = setup
+				}
+				title.about_html = fs.readFileSync("./public/" + title_id + "/about.html")
+				title.create_html = fs.readFileSync("./public/" + title_id + "/create.html")
 			} catch (err) {
 				console.log(err)
 			}
@@ -1032,30 +1119,86 @@ function load_rules() {
 	}
 }
 
+const PARSE_OPTIONS_CACHE = {}
+
+const HUMAN_OPTIONS_CACHE = {
+	"{}": "None"
+}
+
+function parse_game_options(options_json) {
+	if (options_json in PARSE_OPTIONS_CACHE)
+		return PARSE_OPTIONS_CACHE[options_json]
+	return PARSE_OPTIONS_CACHE[options_json] = Object.freeze(JSON.parse(options_json))
+}
+
+function option_to_english(k) {
+	if (k === true || k === 1)
+		return "yes"
+	if (k === false)
+		return "no"
+	return k.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase())
+}
+
+function format_options(options_json, options) {
+	if (options_json in HUMAN_OPTIONS_CACHE)
+		return HUMAN_OPTIONS_CACHE[options_json]
+	let text = Object.entries(options)
+		.map(([ k, v ]) => {
+			if (k === "players")
+				return v + " Player"
+			if (v === true || v === 1)
+				return option_to_english(k)
+			return option_to_english(k) + "=" + option_to_english(v)
+		})
+		.join(", ")
+	return (HUMAN_OPTIONS_CACHE[options_json] = text)
+}
+
 function get_game_roles(title_id, scenario, options) {
-	if (typeof options === "string")
-		options = JSON.parse(options)
 	let roles = RULES[title_id].roles
 	if (typeof roles === 'function')
 		return roles(scenario, options)
 	return roles
 }
 
-function is_game_full(title_id, scenario, options, players) {
-	return get_game_roles(title_id, scenario, options).length === players.length
-}
-
-function is_game_ready(title_id, scenario, options, players) {
+function is_game_ready(player_count, players) {
+	if (player_count !== players.length)
+		return false
 	for (let p of players)
 		if (p.is_invite)
 			return false
-	return is_game_full(title_id, scenario, options, players)
+	return true
 }
 
 load_rules()
 
-const SQL_INSERT_GAME = SQL("INSERT INTO games (owner_id,title_id,scenario,options,is_private,is_random,notice) VALUES (?,?,?,?,?,?,?)")
+const SQL_INSERT_GAME = SQL("INSERT INTO games (owner_id,title_id,scenario,options,player_count,pace,is_private,is_random,notice,is_match) VALUES (?,?,?,?,?,?,?,?,?,?) returning game_id").pluck()
 const SQL_DELETE_GAME = SQL("DELETE FROM games WHERE game_id=? AND owner_id=?")
+
+const SQL_START_GAME = SQL(`
+	update games set
+		status = 1,
+		is_private = (is_private or user_count < player_count),
+		mtime = datetime(),
+		active = ?
+	where
+		game_id = ?
+`)
+
+const SQL_FINISH_GAME = SQL(`
+	update games set
+		status = 2,
+		mtime = datetime(),
+		active = null,
+		result = ?
+	where
+		game_id = ?
+`)
+
+const SQL_UPDATE_GAME_ACTIVE = SQL("update games set active=?,mtime=datetime(),moves=moves+1 where game_id=?")
+
+const SQL_SELECT_GAME_STATE = SQL("select state from game_state where game_id=?").pluck()
+const SQL_INSERT_GAME_STATE = SQL("insert or replace into game_state (game_id,state) values (?,?)")
 
 const SQL_SELECT_UNREAD_CHAT_GAMES = SQL("select game_id from unread_chats where user_id = ?").pluck()
 const SQL_INSERT_UNREAD_CHAT = SQL("insert or ignore into unread_chats (user_id,game_id) values (?,?)")
@@ -1068,12 +1211,7 @@ const SQL_SELECT_GAME_NOTE = SQL("SELECT note FROM game_notes WHERE game_id=? AN
 const SQL_UPDATE_GAME_NOTE = SQL("INSERT OR REPLACE INTO game_notes (game_id,role,note) VALUES (?,?,?)")
 const SQL_DELETE_GAME_NOTE = SQL("DELETE FROM game_notes WHERE game_id=? AND role=?")
 
-const SQL_SELECT_GAME_STATE = SQL("SELECT state FROM game_state WHERE game_id=?").pluck()
-const SQL_UPDATE_GAME_STATE = SQL("INSERT OR REPLACE INTO game_state (game_id,state,active,mtime) VALUES (?,?,?,datetime())")
-const SQL_UPDATE_GAME_RESULT = SQL("UPDATE games SET status=?, result=?, xtime=datetime() WHERE game_id=?")
-const SQL_UPDATE_GAME_PRIVATE = SQL("UPDATE games SET is_private=1 WHERE game_id=?")
-
-const SQL_INSERT_REPLAY = SQL("insert into game_replay (game_id,replay_id,role,action,arguments) values (?, (select coalesce(max(replay_id), 0) + 1 from game_replay where game_id=?) ,?,?,?) returning replay_id").pluck()
+const SQL_INSERT_REPLAY = SQL("insert into game_replay (game_id,replay_id,role,action,arguments) values (?, (select coalesce(max(replay_id), 0) + 1 from game_replay where game_id=?) ,?,?,?)")
 
 const SQL_INSERT_SNAP = SQL("insert into game_snap (game_id,snap_id,state) values (?, (select coalesce(max(snap_id), 0) + 1 from game_snap where game_id=?), ?) returning snap_id").pluck()
 const SQL_SELECT_SNAP = SQL("select state from game_snap where game_id = ? and snap_id = ?").pluck()
@@ -1089,7 +1227,7 @@ const SQL_SELECT_REPLAY = SQL(`
 						json_object('role', role, 'name', name)
 					)
 					from players
-					natural join users
+					join users using(user_id)
 					where game_id = :game_id
 				),
 			'state',
@@ -1115,62 +1253,114 @@ const SQL_SELECT_REPLAY = SQL(`
 
 const SQL_SELECT_GAME = SQL("SELECT * FROM games WHERE game_id=?")
 const SQL_SELECT_GAME_VIEW = SQL("SELECT * FROM game_view WHERE game_id=?")
-const SQL_SELECT_GAME_FULL_VIEW = SQL("SELECT * FROM game_full_view WHERE game_id=?")
 const SQL_SELECT_GAME_TITLE = SQL("SELECT title_id FROM games WHERE game_id=?").pluck()
 
 const SQL_SELECT_PLAYERS_ID = SQL("SELECT DISTINCT user_id FROM players WHERE game_id=?").pluck()
-const SQL_SELECT_PLAYERS = SQL("SELECT * FROM players NATURAL JOIN user_view WHERE game_id=?")
-const SQL_SELECT_PLAYERS_JOIN = SQL("SELECT role, user_id, name, is_invite FROM players NATURAL JOIN users WHERE game_id=?")
+const SQL_SELECT_PLAYERS = SQL("select * from players join user_view using(user_id) where game_id=?")
+const SQL_SELECT_PLAYERS_JOIN = SQL("select role, user_id, name, is_invite from players join users using(user_id) where game_id=?")
 const SQL_UPDATE_PLAYER_ACCEPT = SQL("UPDATE players SET is_invite=0 WHERE game_id=? AND role=? AND user_id=?")
 const SQL_UPDATE_PLAYER_ROLE = SQL("UPDATE players SET role=? WHERE game_id=? AND role=? AND user_id=?")
 const SQL_SELECT_PLAYER_ROLE = SQL("SELECT role FROM players WHERE game_id=? AND user_id=?").pluck()
 const SQL_INSERT_PLAYER_ROLE = SQL("INSERT OR IGNORE INTO players (game_id,role,user_id,is_invite) VALUES (?,?,?,?)")
 const SQL_DELETE_PLAYER_ROLE = SQL("DELETE FROM players WHERE game_id=? AND role=?")
 
-const SQL_SELECT_OPEN_GAMES = SQL(`SELECT * FROM games WHERE status=${STATUS_OPEN}`)
 const SQL_COUNT_OPEN_GAMES = SQL(`SELECT COUNT(*) FROM games WHERE owner_id=? AND status=${STATUS_OPEN}`).pluck()
+const SQL_COUNT_ACTIVE_GAMES = SQL(`
+	select count(*) from games
+	where status < 2 and exists (
+		select 1 from players where players.user_id=? and players.game_id=games.game_id
+	)
+`).pluck()
 
 const SQL_SELECT_REMATCH = SQL(`SELECT game_id FROM games WHERE status < ${STATUS_FINISHED} AND notice=?`).pluck()
 const SQL_INSERT_REMATCH = SQL(`
-	INSERT INTO games
-		(owner_id, title_id, scenario, options, is_private, is_random, notice)
-	SELECT
-		$user_id, title_id, scenario, options, is_private, 0, $magic
-	FROM games
-	WHERE game_id = $game_id AND NOT EXISTS (
-		SELECT * FROM games WHERE notice=$magic
-	)
-`)
+	insert or ignore into games
+		(owner_id, title_id, scenario, options, player_count, pace, is_private, is_random, notice)
+	select
+		$owner_id, title_id, scenario, options, player_count, pace, is_private, 0, $magic
+	from
+		games
+	where
+		game_id = $old_game_id
+		and not exists (
+			select 1 from games where notice = $magic
+		)
+	returning
+		game_id
+`).pluck()
 
 const SQL_INSERT_REMATCH_PLAYERS = SQL("insert into players (game_id, user_id, role, is_invite) select ?, user_id, role, user_id!=? from players where game_id=?")
 
-const QUERY_LIST_PUBLIC_GAMES = SQL(`
-	SELECT * FROM game_view
-	WHERE is_private=0 AND status=?
-	AND EXISTS ( SELECT 1 FROM players WHERE players.game_id = game_view.game_id AND players.user_id = game_view.owner_id )
-	ORDER BY mtime DESC, ctime DESC
-	LIMIT ?
+const QUERY_LIST_PUBLIC_GAMES_OPEN = SQL(`
+	select * from game_view where status=0 and not is_private and join_count > 0 and join_count < player_count
+	order by mtime desc, ctime desc
 	`)
 
-const QUERY_LIST_GAMES_OF_TITLE = SQL(`
-	SELECT * FROM game_view
-	WHERE is_private=0 AND title_id=? AND status=?
-	AND EXISTS ( SELECT 1 FROM players WHERE players.game_id = game_view.game_id AND players.user_id = game_view.owner_id )
-	ORDER BY mtime DESC, ctime DESC
-	LIMIT ?
+const QUERY_LIST_PUBLIC_GAMES_REPLACEMENT = SQL(`
+	select * from game_view where status=1 and not is_private and join_count < player_count
+	order by mtime desc, ctime desc
+	`)
+
+const QUERY_LIST_PUBLIC_GAMES_ACTIVE = SQL(`
+	select * from game_view where status=1 and not is_private and join_count = player_count
+	order by mtime desc, ctime desc
+	limit 12
+	`)
+
+const QUERY_LIST_PUBLIC_GAMES_FINISHED = SQL(`
+	select * from game_view where status=2 and not is_private
+	order by mtime desc, ctime desc
+	limit 12
+	`)
+
+const QUERY_LIST_GAMES_OF_TITLE_OPEN = SQL(`
+	select * from game_view where title_id=? and not is_private and status=0 and join_count > 0 and join_count < player_count
+	order by mtime desc, ctime desc
+	`)
+
+const QUERY_LIST_GAMES_OF_TITLE_READY = SQL(`
+	select * from game_view where title_id=? and not is_private and status=0 and join_count = player_count
+	order by mtime desc, ctime desc
+	`)
+
+const QUERY_LIST_GAMES_OF_TITLE_REPLACEMENT = SQL(`
+	select * from game_view where title_id=? and not is_private and status=1 and join_count < player_count
+	order by mtime desc, ctime desc
+	`)
+
+const QUERY_LIST_GAMES_OF_TITLE_ACTIVE = SQL(`
+	select * from game_view where title_id=? and not is_private and status=1 and join_count = player_count
+	order by mtime desc, ctime desc
+	limit 12
+	`)
+
+const QUERY_LIST_GAMES_OF_TITLE_FINISHED = SQL(`
+	select * from game_view where title_id=? and not is_private and status=2
+	order by mtime desc, ctime desc
+	limit 12
 	`)
 
 const QUERY_NEXT_GAME_OF_USER = SQL(`
 	select title_id, game_id, role
 	from games
-	join game_state using(game_id)
 	join players using(game_id)
 	where
 		status = ${STATUS_ACTIVE}
-		and active in ('All', 'Both', role)
+		and active in (role, 'Both')
 		and user_id = ?
 	order by mtime
 	limit 1
+	`)
+
+const QUERY_LIST_PUBLIC_GAMES_OF_USER = SQL(`
+	select * from game_view
+	where
+		( owner_id=$user_id or game_id in ( select game_id from players where players.user_id=$user_id ) )
+		and
+		( status <= ${STATUS_FINISHED} )
+		and
+		( not is_private or status = ${STATUS_ACTIVE} )
+	order by status asc, mtime desc
 	`)
 
 const QUERY_LIST_ACTIVE_GAMES_OF_USER = SQL(`
@@ -1179,7 +1369,7 @@ const QUERY_LIST_ACTIVE_GAMES_OF_USER = SQL(`
 		( owner_id=$user_id or game_id in ( select game_id from players where players.user_id=$user_id ) )
 		and
 		( status <= ${STATUS_FINISHED} )
-	order by status asc, mtime desc
+	order by status asc, is_opposed desc, mtime desc
 	`)
 
 const QUERY_LIST_FINISHED_GAMES_OF_USER = SQL(`
@@ -1191,55 +1381,58 @@ const QUERY_LIST_FINISHED_GAMES_OF_USER = SQL(`
 	order by status asc, mtime desc
 	`)
 
-function is_solo(players) {
-	return players.every(p => p.user_id === players[0].user_id)
+function check_create_game_limit(user) {
+	if (user.waiting > LIMIT_WAITING_GAMES)
+		return "You have too many games waiting!"
+	if (SQL_COUNT_OPEN_GAMES.get(user.user_id) >= LIMIT_OPEN_GAMES)
+		return "You have too many open games!"
+	if (SQL_COUNT_ACTIVE_GAMES.get(user.user_id) >= LIMIT_ACTIVE_GAMES)
+		return "You cannot join any more games!"
+	return null
 }
 
-function format_options(options) {
-	function to_english(k) {
-		if (k === true || k === 1) return 'yes'
-		if (k === false) return 'no'
-		return k.replace(/_/g, " ").replace(/^\w/, c => c.toUpperCase())
+function check_join_game_limit(user) {
+	if (user.waiting > LIMIT_WAITING_GAMES + 1)
+		return "You have too many games waiting!"
+	if (SQL_COUNT_ACTIVE_GAMES.get(user.user_id) >= LIMIT_ACTIVE_GAMES)
+		return "You cannot join any more games!"
+	return null
+}
+
+function annotate_game_players(game) {
+	game.players = SQL_SELECT_PLAYERS_JOIN.all(game.game_id)
+	if (game.player_count === game.join_count) {
+		game.is_ready = true
+		for (let p of game.players)
+			if (p.is_invite)
+				game.is_ready = false
+	} else {
+		game.is_ready = false
 	}
-	return Object.entries(options||{}).map(([k,v]) => {
-		if (k === "players")
-			return v + " Player"
-		if (v === true || v === 1)
-			return to_english(k)
-		return to_english(k) + "=" + to_english(v)
-	}).join(", ")
 }
 
-function annotate_game(game, user_id, unread) {
-	let players = SQL_SELECT_PLAYERS_JOIN.all(game.game_id)
-	let options = JSON.parse(game.options)
-	let roles = get_game_roles(game.title_id, game.scenario, options)
+function annotate_game_info(game, user_id, unread) {
+	let options = parse_game_options(game.options)
+	game.human_options = format_options(game.options, options)
 
-	if (game.options === '{}')
-		game.human_options = "None"
-	else
-		game.human_options = format_options(options)
-
-	for (let i = 0; i < players.length; ++i)
-		players[i].index = roles.indexOf(players[i].role)
-	players.sort((a, b) => a.index - b.index)
-
-	game.is_full = is_game_full(game.title_id, game.scenario, options, players)
-	game.is_ready = is_game_ready(game.title_id, game.scenario, options, players)
 	game.is_unread = set_has(unread, game.game_id)
 
 	let your_count = 0
 	let your_role = null
-	game.player_names = ""
-	for (let i = 0; i < players.length; ++i) {
-		let p = players[i]
 
+	let roles = get_game_roles(game.title_id, game.scenario, options)
+	for (let p of game.players)
+		p.index = roles.indexOf(p.role)
+	game.players.sort((a, b) => a.index - b.index)
+
+	game.player_names = ""
+	for (let p of game.players) {
 		let p_is_owner = false
 		if (game.status === STATUS_OPEN && (game.owner_id === p.user_id))
 			p_is_owner = true
 
 		let p_is_active = false
-		if (game.status === STATUS_ACTIVE && (game.active === p.role || game.active === "Both" || game.active === "All"))
+		if (game.status === STATUS_ACTIVE && (game.active === p.role || game.active === "Both"))
 			p_is_active = true
 
 		if (p.user_id === user_id) {
@@ -1259,9 +1452,10 @@ function annotate_game(game, user_id, unread) {
 		else
 			link = `<a href="/user/${p.name}">${p.name}</a>`
 
-		if (game.player_names.length > 0)
-			game.player_names += ", "
-		game.player_names += link
+		if (game.player_names)
+			game.player_names += ", " + link
+		else
+			game.player_names = link
 
 		if (game.active === p.role)
 			game.active = link
@@ -1279,13 +1473,17 @@ function annotate_game(game, user_id, unread) {
 	game.mtime = human_date(game.mtime)
 }
 
-function annotate_games(games, user_id, unread) {
-	for (let i = 0; i < games.length; ++i)
-		annotate_game(games[i], user_id, unread)
+function annotate_games(list, user_id, unread) {
+	for (let game of list) {
+		annotate_game_players(game)
+		annotate_game_info(game, user_id, unread)
+	}
+	return list
 }
 
 app.get('/profile', must_be_logged_in, function (req, res) {
 	req.user.notify = SQL_SELECT_USER_NOTIFY.get(req.user.user_id)
+	req.user.is_verified = SQL_SELECT_USER_VERIFIED.get(req.user.user_id)
 	req.user.webhook = SQL_SELECT_WEBHOOK.get(req.user.user_id)
 	res.render('profile.pug', { user: req.user })
 })
@@ -1295,8 +1493,10 @@ app.get('/games', function (req, res) {
 })
 
 function sort_your_turn(a, b) {
-	if (a.your_turn && !b.your_turn) return -1
-	if (!a.your_turn && b.your_turn) return 1
+	if (a.is_opposed && b.is_opposed) {
+		if (a.your_turn && !b.your_turn) return -1
+		if (!a.your_turn && b.your_turn) return 1
+	}
 	return 0
 }
 
@@ -1335,63 +1535,84 @@ app.get('/games/finished/:who_name', function (req, res) {
 })
 
 app.get('/games/public', function (req, res) {
-	let games0 = QUERY_LIST_PUBLIC_GAMES.all(STATUS_OPEN, 1000)
-	let games1 = QUERY_LIST_PUBLIC_GAMES.all(STATUS_ACTIVE, 48)
+	let user_id = 0
+	let unread = null
 	if (req.user) {
-		let unread = SQL_SELECT_UNREAD_CHAT_GAMES.all(req.user.user_id)
-		annotate_games(games0, req.user.user_id, unread)
-		annotate_games(games1, req.user.user_id, unread)
-	} else {
-		annotate_games(games0, 0, null)
-		annotate_games(games1, 0, null)
+		user_id = req.user.user_id
+		unread = SQL_SELECT_UNREAD_CHAT_GAMES.all(req.user.user_id)
 	}
-	res.render('games_public.pug', { user: req.user, games0, games1 })
-})
 
-app.get('/info/:title_id', function (req, res) {
-	return res.redirect('/' + req.params.title_id)
+	let open_games = QUERY_LIST_PUBLIC_GAMES_OPEN.all()
+	let replacement_games = QUERY_LIST_PUBLIC_GAMES_REPLACEMENT.all()
+	let active_games = QUERY_LIST_PUBLIC_GAMES_ACTIVE.all()
+	let finished_games = QUERY_LIST_PUBLIC_GAMES_FINISHED.all()
+
+	annotate_games(open_games, user_id, unread)
+	annotate_games(replacement_games, user_id, unread)
+	annotate_games(active_games, user_id, unread)
+	annotate_games(finished_games, user_id, unread)
+
+	res.render('games_public.pug', {
+		user: req.user,
+		open_games,
+		replacement_games,
+		active_games,
+		finished_games
+	})
 })
 
 function get_title_page(req, res, title_id) {
-	let title = TITLES[title_id]
+	let title = TITLE_TABLE[title_id]
 	if (!title)
 		return res.status(404).send("Invalid title.")
 	let unread = null
 	if (req.user)
 		unread = SQL_SELECT_UNREAD_CHAT_GAMES.all(req.user.user_id)
-	let games0 = QUERY_LIST_GAMES_OF_TITLE.all(title_id, STATUS_OPEN, 1000)
-	let games1 = QUERY_LIST_GAMES_OF_TITLE.all(title_id, STATUS_ACTIVE, 1000)
-	let games2 = QUERY_LIST_GAMES_OF_TITLE.all(title_id, STATUS_FINISHED, 24)
-	annotate_games(games0, req.user ? req.user.user_id : 0, unread)
-	annotate_games(games1, req.user ? req.user.user_id : 0, unread)
-	annotate_games(games2, req.user ? req.user.user_id : 0, unread)
+	let user_id = req.user ? req.user.user_id : 0
+
+	let open_games = QUERY_LIST_GAMES_OF_TITLE_OPEN.all(title_id)
+	let ready_games = QUERY_LIST_GAMES_OF_TITLE_READY.all(title_id)
+	let replacement_games = QUERY_LIST_GAMES_OF_TITLE_REPLACEMENT.all(title_id)
+	let active_games = QUERY_LIST_GAMES_OF_TITLE_ACTIVE.all(title_id)
+	let finished_games = QUERY_LIST_GAMES_OF_TITLE_FINISHED.all(title_id)
+
+	annotate_games(open_games, user_id, unread)
+	annotate_games(ready_games, user_id, unread)
+	annotate_games(replacement_games, user_id, unread)
+	annotate_games(active_games, user_id, unread)
+	annotate_games(finished_games, user_id, unread)
+
 	res.render('info.pug', {
 		user: req.user,
 		title: title,
-		about_html: HTML_ABOUT[title_id],
-		games0, games1, games2
+		open_games,
+		ready_games,
+		replacement_games,
+		active_games,
+		finished_games
 	})
 }
 
-for (let title_id in TITLES)
-	app.get('/' + title_id, (req, res) => get_title_page(req, res, title_id))
+for (let title of TITLE_LIST)
+	app.get('/' + title.title_id, (req, res) => get_title_page(req, res, title.title_id))
 
 app.get('/create/:title_id', must_be_logged_in, function (req, res) {
 	let title_id = req.params.title_id
-	let title = TITLES[title_id]
+	let title = TITLE_TABLE[title_id]
 	if (!title)
 		return res.status(404).send("Invalid title.")
 	res.render('create.pug', {
 		user: req.user,
 		title: title,
+		limit: check_create_game_limit(req.user),
 		scenarios: RULES[title_id].scenarios,
-		create_html: HTML_CREATE[title_id],
 	})
 })
 
 function options_json_replacer(key, value) {
 	if (key === 'scenario') return undefined
 	if (key === 'notice') return undefined
+	if (key === 'pace') return undefined
 	if (key === 'is_random') return undefined
 	if (key === 'is_private') return undefined
 	if (value === 'true') return true
@@ -1405,23 +1626,27 @@ function options_json_replacer(key, value) {
 
 app.post("/create/:title_id", must_be_logged_in, function (req, res) {
 	let title_id = req.params.title_id
-	let priv = req.body.is_private === "true"
-	let rand = req.body.is_random === "true"
+	let priv = req.body.is_private === "true" ? 1 : 0
+	let rand = req.body.is_random === "true" ? 1 : 0
+	let pace = req.body.pace | 0
 	let user_id = req.user.user_id
 	let scenario = req.body.scenario
 	let options = JSON.stringify(req.body, options_json_replacer)
 	let notice = req.body.notice
 
-	let count = SQL_COUNT_OPEN_GAMES.get(user_id)
-	if (count >= 5)
-		return res.send("You have too many open games!")
+	let limit = check_create_game_limit(req.user)
+	if (limit)
+		return res.send(limit)
+
 	if (!(title_id in RULES))
 		return res.send("Invalid title.")
 	if (!RULES[title_id].scenarios.includes(scenario))
 		return res.send("Invalid scenario.")
 
-	let info = SQL_INSERT_GAME.run(user_id, title_id, scenario, options, priv ? 1 : 0, rand ? 1 : 0, notice)
-	res.redirect("/join/" + info.lastInsertRowid)
+	let player_count = get_game_roles(title_id, scenario, parse_game_options(options)).length
+
+	let game_id = SQL_INSERT_GAME.get(user_id, title_id, scenario, options, player_count, pace, priv, rand, notice, 0)
+	res.redirect("/join/" + game_id)
 })
 
 app.get('/delete/:game_id', must_be_logged_in, function (req, res) {
@@ -1435,21 +1660,49 @@ app.get('/delete/:game_id', must_be_logged_in, function (req, res) {
 	res.redirect('/'+title_id)
 })
 
+function insert_replay_players(old_game_id, new_game_id, req_user_id) {
+	let game = SQL_SELECT_GAME.get(old_game_id)
+	let players = SQL_SELECT_PLAYERS_JOIN.all(old_game_id)
+	let roles = get_game_roles(game.title_id, game.scenario, parse_game_options(game.options))
+	let n = roles.length
+
+	if (players.length !== n)
+		throw new Error("missing players")
+
+	if (TITLE_TABLE[game.title_id].is_symmetric)
+		shuffle(players)
+	else
+		players.sort((a, b) => roles.indexOf(a.role) - roles.indexOf(b.role))
+
+	for (let i = 0; i < n; ++i)
+		players[i].role = roles[(i+1) % n]
+
+	for (let p of players)
+		SQL_INSERT_PLAYER_ROLE.run(new_game_id, p.role, p.user_id, p.user_id !== req_user_id ? 1 : 0)
+}
+
 app.get('/rematch/:old_game_id', must_be_logged_in, function (req, res) {
 	let old_game_id = req.params.old_game_id | 0
 	let magic = "\u{1F503} " + old_game_id
 	let new_game_id = 0
-	let info = SQL_INSERT_REMATCH.run({user_id: req.user.user_id, game_id: old_game_id, magic: magic})
-	if (info.changes === 1) {
-		new_game_id = info.lastInsertRowid
-		SQL_INSERT_REMATCH_PLAYERS.run(new_game_id, req.user.user_id, old_game_id)
-	} else {
-		new_game_id = SQL_SELECT_REMATCH.get(magic)
-	}
-	return res.redirect('/join/'+new_game_id)
-})
 
-var join_clients = {}
+	SQL_BEGIN.run()
+	try {
+		new_game_id = SQL_INSERT_REMATCH.get({owner_id: req.user.user_id, old_game_id, magic})
+		if (new_game_id)
+			insert_replay_players(old_game_id, new_game_id, req.user.user_id)
+		else
+			new_game_id = SQL_SELECT_REMATCH.get(magic)
+		SQL_COMMIT.run()
+	} catch (err) {
+		return res.send(err.toString())
+	} finally {
+		if (db.inTransaction)
+			SQL_ROLLBACK.run()
+	}
+
+	return res.redirect("/join/"+new_game_id)
+})
 
 function update_join_clients_deleted(game_id) {
 	let list = join_clients[game_id]
@@ -1479,7 +1732,7 @@ function update_join_clients_players(game_id) {
 	let list = join_clients[game_id]
 	if (list && list.length > 0) {
 		let players = SQL_SELECT_PLAYERS_JOIN.all(game_id)
-		let ready = is_game_ready(list.title_id, list.scenario, list.options, players)
+		let ready = is_game_ready(list.player_count, players)
 		for (let {res} of list) {
 			res.write("retry: 15000\n")
 			res.write("event: players\n")
@@ -1496,24 +1749,22 @@ app.get('/join/:game_id', must_be_logged_in, function (req, res) {
 	if (!game)
 		return res.status(404).send("Invalid game ID.")
 
-	let options = JSON.parse(game.options)
-	if (game.options === '{}')
-		game.human_options = "None"
-	else
-		game.human_options = format_options(options)
+	let options = parse_game_options(game.options)
+	game.human_options = format_options(game.options, options)
 
-	let roles = get_game_roles(game.title_id, game.scenario, game.options)
+	let roles = get_game_roles(game.title_id, game.scenario, options)
 	let players = SQL_SELECT_PLAYERS_JOIN.all(game_id)
 	let whitelist = SQL_SELECT_CONTACT_WHITELIST.all(req.user.user_id)
 	let blacklist = SQL_SELECT_CONTACT_BLACKLIST.all(req.user.user_id)
 	let friends = null
 	if (game.owner_id === req.user.user_id)
 		friends = SQL_SELECT_CONTACT_FRIEND_NAMES.all(req.user.user_id)
-	let ready = (game.status === STATUS_OPEN) && is_game_ready(game.title_id, game.scenario, game.options, players)
+	let ready = (game.status === STATUS_OPEN) && is_game_ready(game.player_count, players)
 	game.ctime = human_date(game.ctime)
 	game.mtime = human_date(game.mtime)
 	res.render('join.pug', {
-		user: req.user, game, roles, players, ready, whitelist, blacklist, friends
+		user: req.user, game, roles, players, ready, whitelist, blacklist, friends,
+		limit: check_join_game_limit(req.user)
 	})
 })
 
@@ -1531,9 +1782,7 @@ app.get('/join-events/:game_id', must_be_logged_in, function (req, res) {
 	}
 	if (!(game_id in join_clients)) {
 		join_clients[game_id] = []
-		join_clients[game_id].title_id = game.title_id
-		join_clients[game_id].scenario = game.scenario
-		join_clients[game_id].options = JSON.parse(game.options)
+		join_clients[game_id].player_count = game.player_count
 	}
 	join_clients[game_id].push({ res: res, user_id: req.user.user_id})
 
@@ -1555,7 +1804,7 @@ app.get('/join-events/:game_id', must_be_logged_in, function (req, res) {
 
 function do_join(res, game_id, role, user_id, is_invite) {
 	let game = SQL_SELECT_GAME.get(game_id)
-	let roles = get_game_roles(game.title_id, game.scenario, game.options)
+	let roles = get_game_roles(game.title_id, game.scenario, parse_game_options(game.options))
 	if (game.is_random && game.status === STATUS_OPEN) {
 		let m = role.match(/^Random (\d+)$/)
 		if (!m || Number(m[1]) < 1 || Number(m[1]) > roles.length)
@@ -1579,6 +1828,9 @@ function do_join(res, game_id, role, user_id, is_invite) {
 app.post('/join/:game_id/:role', must_be_logged_in, function (req, res) {
 	let game_id = req.params.game_id | 0
 	let role = req.params.role
+	let limit = check_join_game_limit(req.user)
+	if (limit)
+		return res.send(limit)
 	do_join(res, game_id, role, req.user.user_id, 0)
 })
 
@@ -1593,6 +1845,7 @@ app.post('/invite/:game_id/:role/:user', must_be_logged_in, function (req, res) 
 })
 
 app.post('/accept/:game_id/:role', must_be_logged_in, function (req, res) {
+	// TODO: check join game limit if inviting self...
 	let game_id = req.params.game_id | 0
 	let role = req.params.role
 	let info = SQL_UPDATE_PLAYER_ACCEPT.run(game_id, role, req.user.user_id)
@@ -1612,14 +1865,14 @@ app.post('/part/:game_id/:role', must_be_logged_in, function (req, res) {
 	res.send("SUCCESS")
 })
 
-function assign_random_roles(game, players) {
+function assign_random_roles(game, options, players) {
 	function pick_random_item(list) {
 		let k = crypto.randomInt(list.length)
 		let r = list[k]
 		list.splice(k, 1)
 		return r
 	}
-	let roles = get_game_roles(game.title_id, game.scenario, game.options).slice()
+	let roles = get_game_roles(game.title_id, game.scenario, options).slice()
 	for (let p of players) {
 		let old_role = p.role
 		p.role = pick_random_item(roles)
@@ -1635,27 +1888,46 @@ app.post('/start/:game_id', must_be_logged_in, function (req, res) {
 		return res.send("Not authorized to start that game ID.")
 	if (game.status !== STATUS_OPEN)
 		return res.send("The game is already started.")
-	let players = SQL_SELECT_PLAYERS.all(game_id)
-	if (!is_game_ready(game.title_id, game.scenario, game.options, players))
-		return res.send("Invalid scenario/options/player configuration!")
-	if (game.is_random) {
-		assign_random_roles(game, players)
-		players = SQL_SELECT_PLAYERS.all(game_id)
-		update_join_clients_players(game_id)
+	if (game.join_count !== game.player_count)
+		return res.send("The game does not have enough players.")
+
+	try {
+		start_game(game)
+	} catch (err) {
+		console.log(err)
+		return res.send(err.toString())
 	}
-	let options = game.options ? JSON.parse(game.options) : {}
-	let seed = random_seed()
-	let state = RULES[game.title_id].setup(seed, game.scenario, options)
-
-	SQL_UPDATE_GAME_RESULT.run(1, null, game_id)
-	if (is_solo(players))
-		SQL_UPDATE_GAME_PRIVATE.run(game_id)
-	mail_game_started_notification_to_offline_users(game_id)
-
-	put_new_state(game_id, state, null, null, ".setup", [seed, game.scenario, options])
 
 	res.send("SUCCESS")
 })
+
+function start_game(game) {
+	let options = parse_game_options(game.options)
+	let seed = random_seed()
+	let state = RULES[game.title_id].setup(seed, game.scenario, options)
+
+	SQL_BEGIN.run()
+	try {
+		if (game.is_random)
+			assign_random_roles(game, options, SQL_SELECT_PLAYERS_JOIN.all(game.game_id))
+
+		SQL_START_GAME.run(state.active, game.game_id)
+		put_replay(game.game_id, null, ".setup", [seed, game.scenario, options])
+		put_snap(game.game_id, state)
+		SQL_INSERT_GAME_STATE.run(game.game_id, JSON.stringify(state))
+
+		SQL_COMMIT.run()
+	} finally {
+		if (db.inTransaction)
+			SQL_ROLLBACK.run()
+	}
+
+	update_join_clients_game(game.game_id)
+	update_join_clients_players(game.game_id)
+
+	send_game_started_notification_to_offline_users(game.game_id)
+	send_your_turn_notification_to_offline_users(game.game_id, null, state.active)
+}
 
 app.get('/play/:game_id/:role', function (req, res) {
 	let game_id = req.params.game_id | 0
@@ -1690,6 +1962,97 @@ app.get('/api/replay/:game_id', function (req, res) {
 })
 
 /*
+ * ELO RATINGS
+ *
+ * TODO:
+ * use role ratings in asymmetric games based on title_id, scenario, player_count
+ * add role_rating to Ev and update role_rating with low K-value
+ */
+
+const SQL_SELECT_RATING_GAME = SQL("select * from rated_games_view where game_id=?")
+const SQL_SELECT_RATING_PLAYERS = SQL("select * from player_rating_view where game_id=?")
+const SQL_INSERT_RATING = SQL("insert or replace into ratings (title_id,user_id,rating,count,last) values (?,?,?,?,?)")
+
+function elo_k(a) {
+	return a.count < 10 ? 60 : 30
+}
+
+function elo_ev(a, players) {
+	// https://arxiv.org/pdf/2104.05422.pdf
+	// original: 1 / ( 1 + 10**((Rb-Ra)/400) )
+	// unoptimized: 10**(Ra/400) / ( 10**(Ra/400) + 10**(Rb/400) )
+	// generalized: 10**(Ra/400) / ( 10**(Ra/400) + 10**(Rb/400) + 10**(Rc/400) + ... )
+	let sum = 0
+	for (let p of players)
+		sum += 10**(p.rating/400)
+	return 10**(a.rating/400) / sum
+}
+
+function elo_change(a, players, score) {
+	return Math.round( elo_k(a) * ( score - elo_ev(a, players) ) )
+}
+
+function update_elo_ratings(game_id) {
+	let game = SQL_SELECT_RATING_GAME.get(game_id)
+	if (!game)
+		return
+
+	let players = SQL_SELECT_RATING_PLAYERS.all(game_id)
+
+	let winner = null
+	for (let p of players)
+		if (p.role === game.result)
+			winner = p
+
+	for (let p of players)
+		if (winner !== null)
+			p.change = elo_change(p, players, p === winner ? 1 : 0)
+		else
+			p.change = elo_change(p, players, 1 / players.length)
+
+	for (let p of players)
+		SQL_INSERT_RATING.run(game.title_id, p.user_id, p.rating + p.change, p.count + 1, game.mtime)
+}
+
+/*
+ * MAIL NOTIFICATIONS
+ */
+
+const MAIL_FROM = process.env.MAIL_FROM || "user@localhost"
+const MAIL_FOOTER = "\n--\nYou can unsubscribe from notifications on your profile page:\n" + SITE_URL + "/profile\n"
+
+function mail_callback(err) {
+	if (err)
+		console.log("MAIL ERROR", err)
+}
+
+function mail_addr(user) {
+	return user.name + " <" + user.mail + ">"
+}
+
+function mail_password_reset_token(user, token) {
+	if (mailer) {
+		let subject = "Password reset request"
+		let body =
+			"Your password reset token is: " + token + "\n\n" +
+			SITE_URL + "/reset-password/" + user.mail + "/" + token + "\n"
+		console.log("SENT MAIL:", mail_addr(user), subject)
+		mailer.sendMail({ from: MAIL_FROM, to: mail_addr(user), subject: subject, text: body }, mail_callback)
+	}
+}
+
+function mail_verification_token(user, token) {
+	if (mailer) {
+		let subject = "Verify mail address"
+		let body =
+			"Your mail verification token is: " + token + "\n\n" +
+			SITE_URL + "/verify-mail/" + token + "\n"
+		console.log("SENT MAIL:", mail_addr(user), subject)
+		mailer.sendMail({ from: MAIL_FROM, to: mail_addr(user), subject: subject, text: body }, mail_callback)
+	}
+}
+
+/*
  * WEBHOOK NOTIFICATIONS
  */
 
@@ -1710,7 +2073,7 @@ const webhook_text_options = {
 }
 
 function on_webhook_success(user_id) {
-	console.log("WEBHOOK SENT", user_id)
+	SQL_UPDATE_WEBHOOK_SUCCESS.run(user_id)
 }
 
 function on_webhook_error(user_id, error) {
@@ -1718,7 +2081,9 @@ function on_webhook_error(user_id, error) {
 	SQL_UPDATE_WEBHOOK_ERROR.run(error, user_id)
 }
 
-function send_webhook(user_id, webhook, message) {
+function send_webhook(user_id, webhook, message, retry=2) {
+	if (!WEBHOOKS)
+		return
 	try {
 		const text = webhook.prefix + " " + message
 		const data = webhook.format ? JSON.stringify({ [webhook.format]: text }) : text
@@ -1726,259 +2091,194 @@ function send_webhook(user_id, webhook, message) {
 		const req = https.request(webhook.url, options, res => {
 			if (res.statusCode === 200 || res.statusCode === 204)
 				on_webhook_success(user_id)
-			else
-				on_webhook_error(user_id, res.statusCode + " " + http.STATUS_CODES[res.statusCode])
+			else {
+				if (retry > 0)
+					retry_webhook(user_id, webhook, message, retry - 1)
+				else
+					on_webhook_error(user_id, res.statusCode + " " + http.STATUS_CODES[res.statusCode])
+			}
 		})
 		req.on("timeout", () => {
-			on_webhook_error(user_id, "Timeout")
+			if (retry > 0)
+				retry_webhook(user_id, webhook, message, retry - 1)
+			else
+				on_webhook_error(user_id, "Timeout")
 			req.abort()
 		})
 		req.on("error", (err) => {
-			on_webhook_error(user_id, err.toString())
+			if (retry > 0)
+				retry_webhook(user_id, webhook, message, retry - 1)
+			else
+				on_webhook_error(user_id, err.toString())
 		})
 		req.write(data)
 		req.end()
 	} catch (err) {
-		on_webhook_error(user_id, err.message)
+		if (retry > 0)
+			retry_webhook(user_id, webhook, message, retry - 1)
+		else
+			on_webhook_error(user_id, err.message)
 	}
 }
 
-function webhook_game_link(game, user) {
-	if (user.role)
-		return SITE_URL + play_url(game.title_id, game.game_id, user.role)
-	return SITE_URL + "/join/" + game.game_id
-}
-
-function webhook_game_started(user, game_id) {
-	let webhook = SQL_SELECT_WEBHOOK_SEND.get(user.user_id)
-	if (webhook) {
-		let game = SQL_SELECT_GAME_VIEW.get(game_id)
-		let message = webhook_game_link(game, user) + " - Started!"
-		send_webhook(user.user_id, webhook, message)
-	}
-}
-
-function webhook_game_finished(user, game_id) {
-	let webhook = SQL_SELECT_WEBHOOK_SEND.get(user.user_id)
-	if (webhook) {
-		let game = SQL_SELECT_GAME_VIEW.get(game_id)
-		let message = webhook_game_link(game, user) + " - Finished!"
-		send_webhook(user.user_id, webhook, message)
-	}
-}
-
-function webhook_your_turn(user, game_id) {
-	let webhook = SQL_SELECT_WEBHOOK_SEND.get(user.user_id)
-	if (webhook) {
-		let game = SQL_SELECT_GAME_VIEW.get(game_id)
-		let message = webhook_game_link(game, user) + " - Your turn!"
-		send_webhook(user.user_id, webhook, message)
-	}
+function retry_webhook(user_id, webhook, message, retry) {
+	console.log("WEBHOOK RETRY", user_id)
+	setTimeout(() => send_webhook(user_id, webhook, message, retry), 3000 + Math.random() * 7000)
 }
 
 /*
- * MAIL NOTIFICATIONS
+ * NOTIFICATIONS
  */
-
-const MAIL_FROM = process.env.MAIL_FROM || "user@localhost"
-const MAIL_FOOTER = "\n--\nYou can unsubscribe from notifications on your profile page:\n" + SITE_URL + "/profile\n"
 
 const SQL_SELECT_NOTIFIED = SQL("SELECT julianday() < julianday(time, ?) FROM last_notified WHERE game_id=? AND user_id=?").pluck()
 const SQL_INSERT_NOTIFIED = SQL("INSERT OR REPLACE INTO last_notified (game_id,user_id,time) VALUES (?,?,datetime())")
 const SQL_DELETE_NOTIFIED = SQL("DELETE FROM last_notified WHERE game_id=? AND user_id=?")
-const SQL_DELETE_NOTIFIED_ALL = SQL("DELETE FROM last_notified WHERE game_id=?")
 
-const QUERY_LIST_YOUR_TURN = SQL("SELECT * FROM your_turn_reminder")
-
-function mail_callback(err) {
-	if (err)
-		console.log("MAIL ERROR", err)
-}
-
-function mail_addr(user) {
-	return user.name + " <" + user.mail + ">"
-}
-
-function mail_game_info(game) {
-	let desc = `Game: ${game.title_name}\n`
-	desc += `Scenario: ${game.scenario}\n`
-	desc += `Players: ${game.player_names}\n`
-	desc += "\n"
-	if (game.notice && game.notice.length > 0)
-		desc += game.notice + "\n"
-	return desc + "\n"
-}
-
-function mail_game_link(game, user) {
-	return SITE_URL + "/" + game.title_id + "/play.html?game=" + game.game_id + "&role=" + encodeURIComponent(user.role) + "\n"
-}
-
-function mail_password_reset_token(user, token) {
-	if (mailer) {
-		let subject = "Password reset request"
-		let body =
-			"Your password reset token is: " + token + "\n\n" +
-			SITE_URL + "/reset-password/" + user.mail + "/" + token + "\n\n" +
-			"If you did not request a password reset you can ignore this mail.\n"
-		console.log("SENT MAIL:", mail_addr(user), subject)
-		mailer.sendMail({ from: MAIL_FROM, to: mail_addr(user), subject: subject, text: body }, mail_callback)
-	}
-}
-
-function mail_new_message(user, msg_id, msg_from) {
-	if (mailer) {
-		let subject = "You have a new message from " + msg_from + "."
-		let body =
-			"Read the message here:\n" +
-			SITE_URL + "/message/read/" + msg_id + "\n" +
-			MAIL_FOOTER
-		console.log("SENT MAIL:", mail_addr(user), subject)
-		mailer.sendMail({ from: MAIL_FROM, to: mail_addr(user), subject: subject, text: body }, mail_callback)
-	}
-}
-
-function mail_game_started_notification(user, game_id) {
-	if (mailer) {
-		let game = SQL_SELECT_GAME_FULL_VIEW.get(game_id)
-		let subject = `${game.title_name} #${game_id} (${user.role}) - Started!`
-		let body = mail_game_info(game) +
-			"The game has started!\n\n" +
-			mail_game_link(game, user) +
-			MAIL_FOOTER
-		console.log("SENT MAIL:", mail_addr(user), subject)
-		mailer.sendMail({ from: MAIL_FROM, to: mail_addr(user), subject: subject, text: body }, mail_callback)
-	}
-}
-
-function mail_game_finished_notification(user, game_id, result) {
-	if (mailer) {
-		let game = SQL_SELECT_GAME_FULL_VIEW.get(game_id)
-		let subject = `${game.title_name} #${game_id} (${user.role}) - Finished!`
-		let body = mail_game_info(game) +
-			"Result: " + result + "\n\n" +
-			mail_game_link(game, user) +
-			MAIL_FOOTER
-		console.log("SENT MAIL:", mail_addr(user), subject)
-		mailer.sendMail({ from: MAIL_FROM, to: mail_addr(user), subject: subject, text: body }, mail_callback)
-	}
-}
-
-function mail_your_turn_notification(user, game_id, interval) {
-	if (mailer) {
-		let too_soon = SQL_SELECT_NOTIFIED.get(interval, game_id, user.user_id)
-		if (!too_soon) {
-			SQL_INSERT_NOTIFIED.run(game_id, user.user_id)
-			let game = SQL_SELECT_GAME_FULL_VIEW.get(game_id)
-			let subject = `${game.title_name} #${game_id} (${user.role}) - Your turn!`
-			let body = mail_game_info(game) +
-				"It's your turn.\n\n" +
-				mail_game_link(game, user) +
-				MAIL_FOOTER
-			console.log("SENT MAIL:", mail_addr(user), subject)
-			mailer.sendMail({ from: MAIL_FROM, to: mail_addr(user), subject: subject, text: body }, mail_callback)
-		}
-	}
-}
-
-function reset_your_turn_notification(user, game_id) {
+function delete_last_notified(user, game_id) {
 	SQL_DELETE_NOTIFIED.run(game_id, user.user_id)
 }
 
-function mail_ready_to_start_notification(user, game_id, interval) {
-	if (mailer) {
-		let too_soon = SQL_SELECT_NOTIFIED.get(interval, game_id, user.user_id)
-		if (!too_soon) {
-			SQL_INSERT_NOTIFIED.run(game_id, user.user_id)
-			let game = SQL_SELECT_GAME_FULL_VIEW.get(game_id)
-			let subject = `${game.title_name} #${game_id} - Ready to start!`
-			let body = mail_game_info(game) +
-				"Your game is ready to start.\n\n" +
-				SITE_URL + "/join/" + game_id + "\n" +
-				MAIL_FOOTER
-			console.log("SENT MAIL:", mail_addr(user), subject)
-			mailer.sendMail({ from: MAIL_FROM, to: mail_addr(user), subject: subject, text: body }, mail_callback)
+function insert_last_notified(user, game_id) {
+	SQL_INSERT_NOTIFIED.run(game_id, user.user_id)
+}
+
+function should_send_reminder(user, game_id) {
+	if (!SQL_SELECT_NOTIFIED.get('+23 hours', game_id, user.user_id))
+		return true
+	return false
+}
+
+function game_play_link(game_id, title_id, user) {
+	return SITE_URL + play_url(title_id, game_id, user.role)
+}
+
+function game_join_link(game_id) {
+	return SITE_URL + "/join/" + game_id
+}
+
+function message_link(msg_id) {
+	return SITE_URL + "/message/read/" + msg_id
+}
+
+function send_notification(user, link, message) {
+	if (WEBHOOKS) {
+		let webhook = SQL_SELECT_WEBHOOK_SEND.get(user.user_id)
+		if (webhook) {
+			console.log("WEBHOOK", user.name, link, message)
+			send_webhook(user.user_id, webhook, link + " - " + message)
 		}
+	}
+	if (mailer && user.notify) {
+		console.log("MAIL", mail_addr(user), link, message)
+		mailer.sendMail(
+			{
+				from: MAIL_FROM,
+				to: mail_addr(user),
+				subject: message,
+				text: link + "\n" + MAIL_FOOTER,
+			},
+			mail_callback
+		)
 	}
 }
 
-function mail_your_turn_notification_to_offline_users(game_id, old_active, active) {
+function send_join_notification(user, game_id, message) {
+	let title_id = SQL_SELECT_GAME_TITLE.get(game_id)
+	let title_name = TITLE_NAME[title_id]
+	send_notification(user, game_join_link(game_id), `${title_name} #${game_id} - ${message}`)
+}
+
+function send_play_notification(user, game_id, message) {
+	let title_id = SQL_SELECT_GAME_TITLE.get(game_id)
+	let title_name = TITLE_NAME[title_id]
+	send_notification(user, game_play_link(game_id, title_id, user), `${title_name} #${game_id} (${user.role}) - ${message}`)
+}
+
+const QUERY_LIST_READY_TO_START = SQL("select * from ready_to_start_reminder")
+const QUERY_LIST_YOUR_TURN = SQL("SELECT * FROM your_turn_reminder")
+const QUERY_LIST_INVITES = SQL("SELECT * FROM invite_reminder")
+
+function send_your_turn_notification_to_offline_users(game_id, old_active, active) {
 	// Only send notifications when the active player changes.
 	if (old_active === active)
 		return
 
 	let players = SQL_SELECT_PLAYERS.all(game_id)
 	for (let p of players) {
-		let p_was_active = (old_active === p.role || old_active === 'Both' || old_active === 'All')
-		let p_is_active = (active === p.role || active === 'Both' || active === 'All')
+		let p_was_active = (old_active === p.role || old_active === 'Both')
+		let p_is_active = (active === p.role || active === 'Both')
 		if (!p_was_active && p_is_active) {
-			if (is_player_online(game_id, p.user_id)) {
-				if (p.notify)
-					reset_your_turn_notification(p, game_id)
+			if (!is_player_online(game_id, p.user_id)) {
+				insert_last_notified(p, game_id)
+				send_play_notification(p, game_id, "Your turn")
 			} else {
-				if (p.notify)
-					mail_your_turn_notification(p, game_id, '+15 minutes')
-				webhook_your_turn(p, game_id)
+				delete_last_notified(p, game_id)
 			}
 		} else {
-			if (p.notify)
-				reset_your_turn_notification(p, game_id)
+			delete_last_notified(p, game_id)
 		}
 	}
 }
 
-function mail_game_started_notification_to_offline_users(game_id) {
+function send_game_started_notification_to_offline_users(game_id) {
 	let players = SQL_SELECT_PLAYERS.all(game_id)
 	for (let p of players) {
-		if (!is_player_online(game_id, p.user_id)) {
-			if (p.notify)
-				mail_game_started_notification(p, game_id)
-			webhook_game_started(p, game_id)
-		}
+		if (!is_player_online(game_id, p.user_id))
+			send_play_notification(p, game_id, "Started")
+		delete_last_notified(p, game_id)
 	}
 }
 
-function mail_game_finished_notification_to_offline_users(game_id, result) {
+function send_game_finished_notification_to_offline_users(game_id, result) {
 	let players = SQL_SELECT_PLAYERS.all(game_id)
 	for (let p of players) {
-		if (!is_player_online(game_id, p.user_id)) {
-			if (p.notify)
-				mail_game_finished_notification(p, game_id, result)
-			webhook_game_finished(p, game_id)
-		}
+		if (!is_player_online(game_id, p.user_id))
+			send_play_notification(p, game_id, "Finished (" + result + ")")
+		delete_last_notified(p, game_id)
 	}
 }
 
 function notify_your_turn_reminder() {
 	for (let item of QUERY_LIST_YOUR_TURN.all()) {
-		mail_your_turn_notification(item, item.game_id, '+25 hours')
+		if (should_send_reminder(item, item.game_id)) {
+			insert_last_notified(item, item.game_id)
+			send_play_notification(item, item.game_id, "Your turn")
+		}
+	}
+}
+
+function notify_invited_reminder() {
+	for (let item of QUERY_LIST_INVITES.all()) {
+		if (should_send_reminder(item, item.game_id)) {
+			insert_last_notified(item, item.game_id)
+			send_join_notification(item, item.game_id, "You have an invitation")
+		}
 	}
 }
 
 function notify_ready_to_start_reminder() {
-	for (let game of SQL_SELECT_OPEN_GAMES.all()) {
-		let players = SQL_SELECT_PLAYERS.all(game.game_id)
-		if (is_game_ready(game.title_id, game.scenario, game.options, players)) {
-			let owner = SQL_OFFLINE_USER.get(game.owner_id, '+3 minutes')
-			if (owner) {
-				if (owner.notify)
-					mail_ready_to_start_notification(owner, game.game_id, '+25 hours')
+	for (let item of QUERY_LIST_READY_TO_START.all()) {
+		if (!is_player_online(item.game_id, item.user_id)) {
+			if (should_send_reminder(item, item.game_id)) {
+				insert_last_notified(item, item.game_id)
+				send_join_notification(item, item.game_id, "Ready to start")
 			}
 		}
 	}
 }
 
-// Check and send daily 'your turn' reminders every 15 minutes.
-setInterval(notify_your_turn_reminder, 15 * 60 * 1000)
+// Send "you've been invited" notifications every 5 minutes.
+setInterval(notify_invited_reminder, 5 * 60 * 1000)
 
-// Check and send ready to start notifications every 5 minutes.
-setInterval(notify_ready_to_start_reminder, 5 * 60 * 1000)
+// Check and send ready to start notifications every 7 minutes.
+setInterval(notify_ready_to_start_reminder, 7 * 60 * 1000)
+
+// Check and send daily your turn reminders every 17 minutes.
+setInterval(notify_your_turn_reminder, 17 * 60 * 1000)
 
 /*
  * GAME SERVER
  */
-
-var game_clients = {}
-var game_cookies = {}
 
 function is_player_online(game_id, user_id) {
 	if (game_clients[game_id])
@@ -2040,7 +2340,7 @@ function snap_from_state(state) {
 function put_replay(game_id, role, action, args) {
 	if (args !== undefined && args !== null && typeof args !== "number")
 		args = JSON.stringify(args)
-	return SQL_INSERT_REPLAY.get(game_id, game_id, role, action, args)
+	SQL_INSERT_REPLAY.run(game_id, game_id, role, action, args)
 }
 
 function put_snap(game_id, state) {
@@ -2050,26 +2350,49 @@ function put_snap(game_id, state) {
 			send_message(other, "snapsize", snap_id)
 }
 
-function put_game_state(game_id, state, old_active) {
-	// TODO: separate state, undo, and log entries to reuse "snap" json stringifaction?
-	if (state.state === "game_over") {
-		SQL_UPDATE_GAME_RESULT.run(2, state.result, game_id)
-		SQL_DELETE_NOTIFIED_ALL.run(game_id)
-		mail_game_finished_notification_to_offline_users(game_id, state.result)
+function put_game_state(game_id, state, old_active, current_role) {
+	// TODO: separate state, undo, and log entries (and reuse "snap" json stringifaction?)
+
+	SQL_INSERT_GAME_STATE.run(game_id, JSON.stringify(state))
+
+	if (state.active !== old_active) {
+		// TODO: add time spent for old_active players
+		// TODO: add time available for new_active players
+		SQL_UPDATE_GAME_ACTIVE.run(state.active, game_id)
 	}
-	SQL_UPDATE_GAME_STATE.run(game_id, JSON.stringify(state), state.active)
-	if (game_clients[game_id])
-		for (let other of game_clients[game_id])
-			send_state(other, state)
-	update_join_clients_game(game_id)
-	mail_your_turn_notification_to_offline_users(game_id, old_active, state.active)
+
+	if (state.state === "game_over") {
+		SQL_FINISH_GAME.run(state.result, game_id)
+		if (state.result && state.result !== "None")
+			update_elo_ratings(game_id)
+	}
 }
 
 function put_new_state(game_id, state, old_active, role, action, args) {
-	let replay_id = put_replay(game_id, role, action, args)
-	if (state.active !== old_active)
-		put_snap(game_id, state)
-	put_game_state(game_id, state, old_active)
+	SQL_BEGIN.run()
+	try {
+		put_replay(game_id, role, action, args)
+
+		if (state.active !== old_active)
+			put_snap(game_id, state)
+
+		put_game_state(game_id, state, old_active, role)
+
+		update_join_clients_game(game_id)
+		if (game_clients[game_id])
+			for (let other of game_clients[game_id])
+				send_state(other, state)
+
+		if (state.state === "game_over")
+			send_game_finished_notification_to_offline_users(game_id, state.result)
+		else
+			send_your_turn_notification_to_offline_users(game_id, old_active, state.active)
+
+		SQL_COMMIT.run()
+	} finally {
+		if (db.inTransaction)
+			SQL_ROLLBACK.run()
+	}
 }
 
 function on_action(socket, action, args, cookie) {
@@ -2078,19 +2401,26 @@ function on_action(socket, action, args, cookie) {
 	else
 		SLOG(socket, "ACTION", action)
 
-	if (typeof cookie === "number") // TODO: for backwards compatibility only, remove later!
-	if (game_cookies[socket.game_id] !== cookie)
-		return send_message(socket, 'error', "Synchronization error!")
-	game_cookies[socket.game_id] ++
+	if (game_cookies[socket.game_id] !== cookie) {
+		send_state(socket, get_game_state(socket.game_id))
+		send_message(socket, "warning", "Synchronization error!")
+		return
+	}
 
 	try {
 		let state = get_game_state(socket.game_id)
 		let old_active = state.active
+
+		// Don't update cookie during simultaneous turns, as it results
+		// in many in-flight collisions.
+		if (old_active !== "Both")
+			game_cookies[socket.game_id] ++
+
 		state = socket.rules.action(state, socket.role, action, args)
 		put_new_state(socket.game_id, state, old_active, socket.role, action, args)
 	} catch (err) {
 		console.log(err)
-		return send_message(socket, 'error', err.toString())
+		return send_message(socket, "error", err.toString())
 	}
 }
 
@@ -2229,7 +2559,7 @@ function on_chat(socket, message) {
 		for (let user_id of users) {
 			let found = false
 			for (let other of game_clients[socket.game_id])
-				if (other.user.user_id === user_id)
+				if (other.user && other.user.user_id === user_id && other.role !== "Observer")
 					found = true
 			if (!found)
 				SQL_INSERT_UNREAD_CHAT.run(user_id, socket.game_id)
@@ -2420,7 +2750,7 @@ wss.on('connection', (socket, req) => {
 
 const SQL_GAME_STATS = SQL(`
 	select
-		title_id, scenario,
+		title_id, player_count, scenario,
 		group_concat(result, '%') as result_role,
 		group_concat(n, '%') as result_count,
 		sum(n) as total
@@ -2428,22 +2758,26 @@ const SQL_GAME_STATS = SQL(`
 		(
 			select
 				title_id,
+				player_count,
 				scenario,
 				result,
 				count(1) as n
 			from
-				opposed_games
+				game_view
 			where
-				( status = ${STATUS_FINISHED} or status = ${STATUS_ARCHIVED} )
-				and
-				( title_id not in ( 'andean-abyss', 'pax-pamir', 'time-of-crisis' ) )
+				is_opposed
+				and ( status = ${STATUS_FINISHED} or status = ${STATUS_ARCHIVED} )
+				and ( title_id not in ( select title_id from titles where is_symmetric ) )
 			group by
 				title_id,
+				player_count,
 				scenario,
 				result
+			order by
+				n desc
 		)
 	group by
-		title_id, scenario
+		title_id, player_count, scenario
 	having
 		total > 12
 	`)
@@ -2451,7 +2785,7 @@ const SQL_GAME_STATS = SQL(`
 app.get('/stats', function (req, res) {
 	let stats = SQL_GAME_STATS.all()
 	stats.forEach(row => {
-		row.title_name = TITLES[row.title_id].title_name
+		row.title_name = TITLE_NAME[row.title_id]
 		row.result_role = row.result_role.split("%")
 		row.result_count = row.result_count.split("%").map(Number)
 	})
@@ -2463,31 +2797,81 @@ app.get('/stats', function (req, res) {
 
 const SQL_USER_STATS = SQL(`
 	select
-		title_name,
+		titles.title_name,
 		scenario,
 		role,
 		sum(role=result) as won,
 		count(*) as total
 	from
 		players
-		natural join games
-		natural join titles
+		join game_view using(game_id)
+		join titles using(title_id)
 	where
-		user_id = ?
+		not is_symmetric
+		and user_id = ?
+		and is_opposed
 		and ( status = ${STATUS_FINISHED} or status = ${STATUS_ARCHIVED} )
-		and game_id in (select game_id from opposed_games)
 	group by
-		title_name,
+		titles.title_name,
 		scenario,
 		role
+	union
+	select
+		titles.title_name,
+		scenario,
+		null as role,
+		sum(role=result) as won,
+		count(*) as total
+	from
+		players
+		join game_view using(game_id)
+		join titles using(title_id)
+	where
+		is_symmetric
+		and user_id = ?
+		and is_opposed
+		and ( status = ${STATUS_FINISHED} or status = ${STATUS_ARCHIVED} )
+	group by
+		titles.title_name,
+		scenario
 	`)
 
-app.get('/user-stats/:who_name', function (req, res) {
+const SQL_USER_RATINGS = SQL(`
+	select title_name, rating, count, date(last) as last
+	from ratings
+	join titles using(title_id)
+	where user_id = ?
+	and count >= 5
+	order by rating desc
+	`)
+
+const SQL_GAME_RATINGS = SQL(`
+	select name, rating, count, date(last) as last
+	from ratings
+	join users using(user_id)
+	where title_id = ? and rating >= 1600 and count >= 10
+	order by rating desc
+	limit 50
+	`)
+
+app.get('/user-stats/:who_name', must_be_administrator, function (req, res) {
 	let who = SQL_SELECT_USER_BY_NAME.get(req.params.who_name)
 	if (who) {
-		let stats = SQL_USER_STATS.all(who.user_id)
-		res.render('user_stats.pug', { user: req.user, who: who, stats: stats })
+		let stats = SQL_USER_STATS.all(who.user_id, who.user_id)
+		let ratings = SQL_USER_RATINGS.all(who.user_id)
+		res.render('user_stats.pug', { user: req.user, who, stats, ratings })
 	} else {
 		return res.status(404).send("Invalid user name.")
+	}
+})
+
+app.get('/game-stats/:title_id', must_be_administrator, function (req, res) {
+	let title_id = req.params.title_id
+	if (title_id in TITLE_TABLE) {
+		let title_name = TITLE_NAME[title_id]
+		let ratings = SQL_GAME_RATINGS.all(title_id)
+		res.render('game_stats.pug', { user: req.user, title_name, ratings })
+	} else {
+		return res.status(404).send("Invalid title.")
 	}
 })
