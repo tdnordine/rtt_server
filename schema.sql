@@ -13,6 +13,7 @@ create table if not exists titles (
 	title_id text primary key,
 	title_name text,
 	bgg integer,
+	is_symmetric boolean default 0,
 	is_hidden boolean default 0
 ) without rowid;
 
@@ -28,7 +29,8 @@ create table if not exists users (
 	user_id integer primary key,
 	name text unique collate nocase,
 	mail text unique collate nocase,
-	notify boolean default 0,
+	notify integer default 0,
+	is_verified boolean default 0,
 	is_banned boolean default 0,
 	ctime datetime default current_timestamp,
 	password text,
@@ -89,7 +91,7 @@ create view user_profile_view as
 		user_id, name, mail, notify, ctime, atime, about, is_banned
 	from
 		users
-		natural left join user_last_seen
+		left join user_last_seen using(user_id)
 	;
 
 drop view if exists user_dynamic_view;
@@ -114,24 +116,102 @@ create view user_dynamic_view as
 			from
 				players
 				join games using(game_id)
-				join game_state using(game_id)
 			where
 				status = 1
+				and user_count = player_count
 				and players.user_id = users.user_id
-				and active in ( players.role, 'Both', 'All' )
+				and active in ( players.role, 'Both' )
 		) + (
 			select
 				count(*)
 			from
 				players
 			where
-				players.user_id = users.user_id
-				and players.is_invite
-		) as active,
+				players.user_id = users.user_id and players.is_invite
+		) + (
+			select
+				count(*)
+			from
+				games
+			where
+				owner_id = users.user_id
+				and status = 0
+				and (
+					join_count = 0
+					or (
+						join_count = player_count
+						and not exists (
+							select 1 from players where players.game_id = games.game_id and players.is_invite
+						)
+					)
+				)
+		) as waiting,
 		is_banned
 	from
 		users
 	;
+
+-- Elo ratings & match making --
+
+drop view if exists rated_games_view;
+create view rated_games_view as
+	select
+		game_id, title_id, player_count, scenario, result, mtime
+	from
+		games
+	where
+		status > 1
+		and moves > 5
+		and user_count = player_count
+		and player_count > 1
+		and not exists (
+			select 1 from players where players.game_id = games.game_id and user_id = 0
+		)
+;
+
+create table if not exists ratings (
+	title_id integer,
+	user_id integer,
+	rating integer,
+	count integer,
+	last timestamp,
+	primary key (title_id, user_id)
+) without rowid;
+
+drop view if exists rating_view;
+create view rating_view as
+	select
+		title_id, name, rating, count, last
+	from
+		ratings
+		join users using(title_id, user_id)
+	order by
+		title_id,
+		rating desc
+;
+
+drop view if exists player_rating_view;
+create view player_rating_view as
+	select
+		games.game_id,
+		players.user_id,
+		players.role,
+		coalesce(rating, 1500) as rating,
+		coalesce(count, 0) as count
+	from players
+	join games using(game_id)
+	left join ratings using(title_id, user_id)
+;
+
+create table if not exists setups (
+	setup_id integer primary key,
+	setup_name text,
+	title_id text,
+	player_count integer,
+	scenario text,
+	options text,
+	unique (title_id, player_count, scenario)
+);
 
 -- Friend and Block Lists --
 
@@ -266,26 +346,38 @@ create index if not exists posts_thread_idx on posts(thread_id);
 
 -- Forum Search (FTS5) --
 
-drop table if exists forum_search;
-create virtual table forum_search using fts5(thread_id, post_id, text, tokenize='porter unicode61');
-insert into forum_search(thread_id,post_id,text) select thread_id, 0, subject from threads;
-insert into forum_search(thread_id,post_id,text) select thread_id, post_id, body from posts;
+-- drop table if exists forum_search;
+create virtual table if not exists forum_search using fts5(thread_id, post_id, text, tokenize='porter unicode61');
+-- insert into forum_search(thread_id,post_id,text) select thread_id, 0, subject from threads;
+-- insert into forum_search(thread_id,post_id,text) select thread_id, post_id, body from posts;
 
 -- Games --
 
 create table if not exists games (
 	game_id integer primary key,
+	status integer default 0,
+
 	title_id text,
 	scenario text,
 	options text,
-	owner_id integer,
-	ctime datetime default current_timestamp,
+
+	player_count integer default 2,
+	join_count integer default 0,
+	invite_count integer default 0,
+	user_count integer default 0,
+
+	owner_id integer default 0,
+	notice text,
+	pace integer default 0,
 	is_private boolean default 0,
 	is_random boolean default 0,
-	notice text,
-	status integer default 0,
-	result text,
-	xtime datetime
+	is_match boolean default 0,
+
+	ctime datetime default current_timestamp,
+	mtime datetime default current_timestamp,
+	moves integer default 0,
+	active text,
+	result text
 );
 
 create index if not exists games_title_idx on games(title_id);
@@ -293,8 +385,6 @@ create index if not exists games_status_idx on games(status);
 
 create table if not exists game_state (
 	game_id integer primary key,
-	mtime datetime,
-	active text,
 	state text
 );
 
@@ -319,7 +409,7 @@ create view game_chat_view as
 		game_id, chat_id, time, name, message
 	from
 		game_chat
-		natural join users
+		join users using(user_id)
 	;
 
 create table if not exists game_replay (
@@ -362,56 +452,29 @@ create view game_view as
 		games.*,
 		titles.title_name,
 		owner.name as owner_name,
-		coalesce(game_state.mtime, xtime) as mtime,
-		game_state.active
+		user_count = join_count and join_count > 1 as is_opposed
 	from
 		games
-		natural left join game_state
-		natural join titles
+		join titles using(title_id)
 		join users as owner
 			on owner.user_id = games.owner_id
 	;
 
-drop view if exists game_full_view;
-create view game_full_view as
+drop view if exists ready_to_start_reminder;
+create view ready_to_start_reminder as
 	select
-		*,
-		(
-			select
-				group_concat(name, ', ')
-			from
-				players
-				natural join users
-			where
-				players.game_id = game_view.game_id
-		) as player_names,
-		(
-			select
-				count(distinct user_id) = 1
-			from
-				players
-			where
-				players.game_id = game_view.game_id
-		) as is_solo
-	from
-		game_view
-	;
-
-drop view if exists opposed_games;
-create view opposed_games as
-	select
-		*
+		game_id, owner_id as user_id, name, mail, notify
 	from
 		games
+		join users on user_id = owner_id
 	where
-		status > 0
-		and (
-			select
-				count(distinct user_id) > 1
-			from
-				players
+		status = 0
+		and join_count = player_count
+		and not exists (
+			select 1 from players
 			where
 				players.game_id = games.game_id
+				and is_invite
 		)
 	;
 
@@ -420,29 +483,52 @@ create view your_turn_reminder as
 	select
 		game_id, role, user_id, name, mail, notify
 	from
-		game_full_view
+		games
 		join players using(game_id)
 		join users using(user_id)
 	where
 		status = 1
-		and active in ('All', 'Both', role)
-		and is_solo = 0
-		and notify = 1
+		and active in (role, 'Both')
+		and user_count > 1
 		and julianday() > julianday(mtime, '+1 hour')
 	;
 
-drop view if exists your_turn;
-create view your_turn as
+drop view if exists invite_reminder;
+create view invite_reminder as
 	select
-		game_id, user_id, role
+		game_id, role, user_id, name, mail, notify
 	from
 		players
-		join games using(game_id)
-		join game_state using(game_id)
+		join users using(user_id)
 	where
-		status = 1
-		and active in ('All', 'Both', role)
+		is_invite = 1
 	;
+
+-- Trigger to update player counts when players join and part games
+
+drop trigger if exists trigger_join_game;
+create trigger trigger_join_game after insert on players
+begin
+	update
+		games
+	set
+		join_count = ( select count(1) from players where players.game_id = new.game_id ),
+		user_count = ( select count(distinct user_id) from players where players.game_id = new.game_id )
+	where
+		games.game_id = new.game_id;
+end;
+
+drop trigger if exists trigger_part_game;
+create trigger trigger_part_game after delete on players
+begin
+	update
+		games
+	set
+		join_count = ( select count(1) from players where players.game_id = old.game_id ),
+		user_count = ( select count(distinct user_id) from players where players.game_id = old.game_id )
+	where
+		games.game_id = old.game_id;
+end;
 
 -- Trigger to remove game data when filing a game as archived
 
@@ -488,8 +574,9 @@ begin
 	delete from posts where author_id = old.user_id;
 	delete from threads where author_id = old.user_id;
 	delete from game_chat where user_id = old.user_id;
-	delete from players where user_id = old.user_id;
+	delete from ratings where user_id = old.user_id;
 	update games set owner_id = 0 where owner_id = old.user_id;
+	update players set user_id = 0 where user_id = old.user_id;
 end;
 
 drop trigger if exists trigger_delete_on_threads;
